@@ -1,0 +1,2 @@
+#sequence_type	reference_file	type	sequence	sequenced_covered	coverage_depth	sequence_identity	query	q_start	q_end	s_start	s_end	evalue
+most_likely	/mnt/beegfs/scratch/ONEIDA/cimendes/amplicon_downsample/DEN-IM/work/71/48d9af1d76753b64ee427ae3519979/references/1_GenotypesDENV_14-05-18.headers_renamed.fasta	3-III	gb:HQ671177|Organism:Dengue_virus_3|Strain_Name:DENV-3/NI/BID-V4830/2009|Segment:null|Subtype:3-III|Host:Human|gaps_removed|seqTyping_3-III	18.73156342182891	7.205249343832021	99.05511811023622	NA	NA	NA	NA	NA	NA
