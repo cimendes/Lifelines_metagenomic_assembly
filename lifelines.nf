@@ -588,284 +588,190 @@ file ".versions"
 }
 
 
-if ( !params.minAssemblyCoverage_3_6.toString().isNumber() ){
-    if (params.minAssemblyCoverage_3_6.toString() != 'auto'){
-        exit 1, "'minAssemblyCoverage_3_6' parameter must be a number or 'auto'. Provided value: ${params.minAssemblyCoverage_3_6}"
-    }
-}
-if ( !params.AMaxContigs_3_6.toString().isNumber() ){
-    exit 1, "'AMaxContigs_3_6' parameter must be a number. Provide value: '${params.AMaxContigs_3_6}'"
-}
+IN_min_contig_lenght_3_6 = Channel.value(params.min_contig_lenght_3_6)
+IN_max_iteration_3_6 = Channel.value(params.max_iteration_3_6)
+IN_prob_threshold_3_6 = Channel.value(params.prob_threshold_3_6)
 
-IN_assembly_mapping_opts_3_6 = Channel.value([params.minAssemblyCoverage_3_6,params.AMaxContigs_3_6])
-IN_genome_size_3_6 = Channel.value(params.genomeSize_3_6)
+clear = params.clearInput_3_6 ? "true" : "false"
+checkpointClear_3_6 = Channel.value(clear)
 
-
-process assembly_mapping_3_6 {
+process maxbin2_3_6 {
 
     // Send POST request to platform
         if ( params.platformHTTP != null ) {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 3_6 $params.platformHTTP"
-        afterScript "final_POST.sh $params.projectId $params.pipelineId 3_6 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 3_6 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId assembly_mapping_3_6 \"$params.platformSpecies\" true"
+        afterScript "final_POST.sh $params.projectId $params.pipelineId 3_6 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 3_6 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId maxbin2_3_6 \"$params.platformSpecies\" true"
     } else {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
         }
 
     tag { sample_id }
+
+    publishDir "results/maxbin2_3_6/${sample_id}/"
 
     input:
     set sample_id, file(assembly), file(fastq) from megahit_out_3_4.join(_LAST_fastq_3_6)
+    val minContigLenght from IN_min_contig_lenght_3_6
+    val maxIterations from IN_max_iteration_3_6
+    val probThreshold from IN_prob_threshold_3_6
+    val clear from checkpointClear_3_6
 
     output:
-    set sample_id, file(assembly), 'coverages.tsv', 'coverage_per_bp.tsv', 'sorted.bam', 'sorted.bam.bai' into MAIN_am_out_3_6
-    set sample_id, file("coverage_per_bp.tsv") optional true into SIDE_BpCoverage_3_6
-    set sample_id, val("3_6_assembly_mapping"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_assembly_mapping_3_6
-set sample_id, val("assembly_mapping_3_6"), val("3_6"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_assembly_mapping_3_6
+    set sample_id, file(assembly), file ('*_maxbin.*.fasta'), file ('bin_status.txt') into binCh_3_6
+    file '*_maxbin.{abundance,log,summary}'
+    set sample_id, file("*_maxbin.summary") into intoReport_3_6
+
+    set sample_id, val("3_6_maxbin2"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_maxbin2_3_6
+set sample_id, val("maxbin2_3_6"), val("3_6"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_maxbin2_3_6
 file ".versions"
 
     script:
     """
     {
-        echo [DEBUG] BUILDING BOWTIE INDEX FOR ASSEMBLY: $assembly >> .command.log 2>&1
-        bowtie2-build --threads ${task.cpus} $assembly genome_index >> .command.log 2>&1
-        echo [DEBUG] MAPPING READS FROM $fastq >> .command.log 2>&1
-        bowtie2 -q --very-sensitive-local --threads ${task.cpus} -x genome_index -1 ${fastq[0]} -2 ${fastq[1]} -S mapping.sam >> .command.log 2>&1
-        echo [DEBUG] CONVERTING AND SORTING SAM TO BAM >> .command.log 2>&1
-        samtools sort -o sorted.bam -O bam -@ ${task.cpus} mapping.sam && rm *.sam  >> .command.log 2>&1
-        echo [DEBUG] CREATING BAM INDEX >> .command.log 2>&1
-        samtools index sorted.bam >> .command.log 2>&1
-        echo [DEBUG] ESTIMATING READ DEPTH >> .command.log 2>&1
-        parallel -j ${task.cpus} samtools depth -ar {} sorted.bam \\> {}.tab  ::: \$(grep ">" $assembly | cut -c 2- | tr " " "_")
-        # Insert 0 coverage count in empty files. See Issue #2
-        echo [DEBUG] REMOVING EMPTY FILES  >> .command.log 2>&1
-        find . -size 0 -print0 | xargs -0 -I{} sh -c 'echo -e 0"\t"0"\t"0 > "{}"'
-        echo [DEBUG] COMPILING COVERAGE REPORT  >> .command.log 2>&1
-        parallel -j ${task.cpus} echo -n {.} '"\t"' '&&' cut -f3 {} '|' paste -sd+ '|' bc >> coverages.tsv  ::: *.tab
-        cat *.tab > coverage_per_bp.tsv
-        rm *.tab
-        if [ -f "coverages.tsv" ]
-        then
-            echo pass > .status
-        else
-            echo fail > .status
-        fi
-        echo -n "" > .report.json
-        echo -n "" > .versions
-    } || {
-        echo fail > .status
-    }
-    """
-}
+        run_MaxBin.pl -contig ${assembly} -out ${sample_id}_maxbin -reads ${fastq[0]} -reads2 ${fastq[1]} \
+        -thread $task.cpus -min_contig_length ${minContigLenght} -max_iteration ${maxIterations} \
+        -prob_threshold ${probThreshold}
 
-
-/** PROCESS_ASSEMBLY_MAPPING -  MAIN
-Processes the results from the assembly_mapping process and filters the
-assembly contigs based on coverage and length thresholds.
-*/
-process process_assembly_mapping_3_6 {
-
-    // Send POST request to platform
-    
-        if ( params.platformHTTP != null ) {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 3_6 $params.platformHTTP"
-        afterScript "final_POST.sh $params.projectId $params.pipelineId 3_6 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 3_6 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId assembly_mapping_3_6 \"$params.platformSpecies\" false"
-    } else {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
-        }
-    
-
-    tag { sample_id }
-    // This process can only use a single CPU
-    cpus 1
-
-    input:
-    set sample_id, file(assembly), file(coverage), file(coverage_bp), file(bam_file), file(bam_index) from MAIN_am_out_3_6
-    val opts from IN_assembly_mapping_opts_3_6
-    val gsize from IN_genome_size_3_6
-
-    output:
-    set sample_id, '*_filt.fasta', 'filtered.bam', 'filtered.bam.bai' into assembly_mapping_out_3_5_dep
-    set sample_id, val("3_6_process_am"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_process_am_3_6
-set sample_id, val("process_am_3_6"), val("3_6"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_process_am_3_6
-file ".versions"
-
-    script:
-    template "process_assembly_mapping.py"
-
-}
-
-
-SIDE_BpCoverage_3_6.set{ SIDE_BpCoverage_3_7 }
-
-
-
-clear = params.clearInput_3_7 ? "true" : "false"
-checkpointClear_3_7 = Channel.value(clear)
-
-process pilon_3_7 {
-
-    // Send POST request to platform
-        if ( params.platformHTTP != null ) {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 3_7 $params.platformHTTP"
-        afterScript "final_POST.sh $params.projectId $params.pipelineId 3_7 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 3_7 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId pilon_3_7 \"$params.platformSpecies\" true"
-    } else {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
-        }
-
-    tag { sample_id }
-    echo false
-    publishDir 'results/assembly/pilon_3_7/', mode: 'copy', pattern: "*.fasta"
-
-    input:
-    set sample_id, file(assembly), file(bam_file), file(bam_index) from assembly_mapping_out_3_5_dep
-    val clear from checkpointClear_3_7
-
-    output:
-    set sample_id, '*_polished.fasta' into _pilon_out_3_5, pilon_report_3_7
-    set sample_id, val("3_7_pilon"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_pilon_3_7
-set sample_id, val("pilon_3_7"), val("3_7"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_pilon_3_7
-file ".versions"
-
-    script:
-    """
-    {
-        pilon_mem=${String.valueOf(task.memory).substring(0, String.valueOf(task.memory).length() - 1).replaceAll("\\s", "")}
-        java -jar -Xms256m -Xmx\${pilon_mem} /NGStools/pilon-1.22.jar --genome $assembly --frags $bam_file --output ${assembly.name.replaceFirst(~/\.[^\.]+$/, '')}_polished --changes --threads $task.cpus >> .command.log 2>&1
         echo pass > .status
+
+        #in case maxbin fails to bin sequences for a sample:
+        if ls *_maxbin.*.fasta 1> /dev/null 2>&1; then echo "true" > bin_status.txt; else echo "false" \
+        > false_maxbin.0.fasta; echo "false" > bin_status.txt; fi
+
 
         if [ "$clear" = "true" ];
         then
             work_regex=".*/work/.{2}/.{30}/.*"
+            file_source1=\$(readlink -f \$(pwd)/${fastq[0]})
+            file_source2=\$(readlink -f \$(pwd)/${fastq[1]})
             assembly_file=\$(readlink -f \$(pwd)/${assembly})
-            bam_file=\$(readlink -f \$(pwd)/${bam_file})
-            if [[ "\$assembly_file" =~ \$work_regex ]]; then
-                rm \$assembly_file \$bam_file
+            if [[ "\$file_source1" =~ \$work_regex ]]; then
+                rm \$file_source1 \$file_source2 \$assembly_file
             fi
         fi
-
     } || {
         echo fail > .status
     }
     """
-
 }
 
-process pilon_report_3_7 {
+process report_maxbin2_3_6{
 
-    
+    // Send POST request to platform
         if ( params.platformHTTP != null ) {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh"
-        afterScript "report_POST.sh $params.projectId $params.pipelineId 3_7 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId pilon_3_7 \"$params.platformSpecies\" false"
-    } else {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh"
-        }
-    
-
-    tag { sample_id }
-
-    input:
-    set sample_id, file(assembly), file(coverage_bp) from pilon_report_3_7.join(SIDE_BpCoverage_3_7)
-
-    output:
-    file "*_assembly_report.csv" into pilon_report_out_3_7
-    set sample_id, val("3_7_pilon_report"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_pilon_report_3_7
-set sample_id, val("pilon_report_3_7"), val("3_7"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_pilon_report_3_7
-file ".versions"
-
-    script:
-    template "assembly_report.py"
-
-}
-
-
-process compile_pilon_report_3_7 {
-
-    publishDir "reports/assembly/pilon_3_7/", mode: 'copy'
-
-    input:
-    file(report) from pilon_report_out_3_7.collect()
-
-    output:
-    file "pilon_assembly_report.csv"
-
-    """
-    echo Sample,Number of contigs,Average contig size,N50,Total assembly length,GC content,Missing data > pilon_assembly_report.csv
-    cat $report >> pilon_assembly_report.csv
-    """
-}
-
-
-_pilon_out_3_5.into{ pilon_out_3_5;mash_dist_in_3_6;mlst_in_3_7;kraken2_fasta_in_3_8;abricate_in_3_9 }
-
-
-IN_shared_hashes_4_8 = Channel.value(params.shared_hashes_4_8)
-
-IN_mash_dist_input = Channel.create()
-// If the side channel with the sketch exists, join the corresponding .msh file
-// with the appropriate sample_id
-if (binding.hasVariable("SIDE_mashSketchOutChannel_4_8")){
-    mash_dist_in_3_6
-        .join(SIDE_mashSketchOutChannel_4_8)
-        .into(IN_mash_dist_input)
-// Otherwise, always use the .msh file provided in the docker image
-} else {
-    mash_dist_in_3_6
-        .map{ it -> [it[0], it[1], params.refFile_4_8] }
-        .into(IN_mash_dist_input)
-}
-
-// runs mash dist
-process runMashDist_4_8 {
-
-        if ( params.platformHTTP != null ) {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 4_8 $params.platformHTTP"
-        afterScript "final_POST.sh $params.projectId $params.pipelineId 4_8 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 4_8 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId mash_dist_4_8 \"$params.platformSpecies\" true"
+        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 3_6 $params.platformHTTP"
+        afterScript "final_POST.sh $params.projectId $params.pipelineId 3_6 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 3_6 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId maxbin2_3_6 \"$params.platformSpecies\" true"
     } else {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
         }
 
     tag { sample_id }
 
-    publishDir 'results/mashdist/mashdist_txt_4_8/'
+    input:
+    set sample_id, file(tsv) from  intoReport_3_6
+
+    output:
+    set sample_id, val("3_6_report_maxbin2"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_report_maxbin2_3_6
+set sample_id, val("report_maxbin2_3_6"), val("3_6"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_report_maxbin2_3_6
+file ".versions"
+
+    script:
+    template "process_tsv.py"
+
+}
+
+// If maxbin fails to obtain bins for a sample, the workflow continues with the original assembly
+_maxbin2_out_3_5 = Channel.create()
+
+OUT_binned = Channel.create()
+OUT_unbinned = Channel.create()
+
+failedBinning = Channel.create()
+successfulBinning = Channel.create()
+
+binCh_3_6.choice(failedBinning, successfulBinning){ it -> it[3].text == "false\n" ? 0 : 1 }
+
+failedBinning.map{ it -> [it[0], it[1]] }.into(OUT_unbinned)
+
+successfulBinning.map{ it -> [it[2].toString().tokenize('/').last().tokenize('.')[0..-2].join('.'), it[2]]}
+    .transpose()
+    .map{it -> [it[1].toString().tokenize('/').last().tokenize('.')[0..-2].join('.'),it[1]]}
+    .into(OUT_binned)
+
+OUT_binned.mix(OUT_unbinned).set{ _maxbin2_out_3_5 }
+
+
+
+_maxbin2_out_3_5.into{ maxbin2_out_3_5;mash_dist_in_3_6;mlst_in_3_7;kraken2_fasta_in_3_8;abricate_in_3_9 }
+
+IN_shared_hashes_4_7 = Channel.value(params.shared_hashes_4_7)
+
+IN_mash_dist_input = Channel.create()
+// If the side channel with the sketch exists, join the corresponding .msh file
+// with the appropriate sample_id
+if (binding.hasVariable("SIDE_mashSketchOutChannel_4_7")){
+    mash_dist_in_3_6
+        .join(SIDE_mashSketchOutChannel_4_7)
+        .into(IN_mash_dist_input)
+// Otherwise, always use the .msh file provided in the docker image
+} else {
+    mash_dist_in_3_6
+        .map{ it -> [it[0], it[1], params.refFile_4_7] }
+        .into(IN_mash_dist_input)
+}
+
+// runs mash dist
+process runMashDist_4_7 {
+
+        if ( params.platformHTTP != null ) {
+        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 4_7 $params.platformHTTP"
+        afterScript "final_POST.sh $params.projectId $params.pipelineId 4_7 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 4_7 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId mash_dist_4_7 \"$params.platformSpecies\" true"
+    } else {
+        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
+        }
+
+    tag { sample_id }
+
+    publishDir 'results/mashdist/mashdist_txt_4_7/'
 
     input:
     set sample_id, file(fasta), refFile from IN_mash_dist_input
 
     output:
-    set sample_id, file(fasta), file("*_mashdist.txt") into mashDistOutChannel_4_8
-    set sample_id, val("4_8_runMashDist"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_runMashDist_4_8
-set sample_id, val("runMashDist_4_8"), val("4_8"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_runMashDist_4_8
+    set sample_id, file(fasta), file("*_mashdist.txt") into mashDistOutChannel_4_7
+    set sample_id, val("4_7_runMashDist"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_runMashDist_4_7
+set sample_id, val("runMashDist_4_7"), val("4_7"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_runMashDist_4_7
 file ".versions"
 
     """
-    mash dist -i -p ${task.cpus} -v ${params.pValue_4_8} \
-    -d ${params.mash_distance_4_8} ${refFile} ${fasta} > ${fasta}_mashdist.txt
+    mash dist -i -p ${task.cpus} -v ${params.pValue_4_7} \
+    -d ${params.mash_distance_4_7} ${refFile} ${fasta} > ${fasta}_mashdist.txt
     """
 
 }
 
 // parses mash dist output to a json file that can be imported into pATLAS
-process mashDistOutputJson_4_8 {
+process mashDistOutputJson_4_7 {
 
         if ( params.platformHTTP != null ) {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 4_8 $params.platformHTTP"
-        afterScript "final_POST.sh $params.projectId $params.pipelineId 4_8 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 4_8 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId mash_dist_4_8 \"$params.platformSpecies\" true"
+        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 4_7 $params.platformHTTP"
+        afterScript "final_POST.sh $params.projectId $params.pipelineId 4_7 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 4_7 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId mash_dist_4_7 \"$params.platformSpecies\" true"
     } else {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
         }
 
     tag { sample_id }
 
-    publishDir 'results/mashdist/mashdist_json_4_8/'
+    publishDir 'results/mashdist/mashdist_json_4_7/'
 
     input:
-    set sample_id, fasta, file(mashtxt) from mashDistOutChannel_4_8
-    val shared_hashes from IN_shared_hashes_4_8
+    set sample_id, fasta, file(mashtxt) from mashDistOutChannel_4_7
+    val shared_hashes from IN_shared_hashes_4_7
 
     output:
     set sample_id, file("*.json") optional true into mash_dist_out_4_6
-    set sample_id, val("4_8_mashDistOutputJson"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_mashDistOutputJson_4_8
-set sample_id, val("mashDistOutputJson_4_8"), val("4_8"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_mashDistOutputJson_4_8
+    set sample_id, val("4_7_mashDistOutputJson"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_mashDistOutputJson_4_7
+set sample_id, val("mashDistOutputJson_4_7"), val("4_7"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_mashDistOutputJson_4_7
 file ".versions"
 
     script:
@@ -875,12 +781,12 @@ file ".versions"
 
 
 
-process mlst_5_9 {
+process mlst_5_8 {
 
     // Send POST request to platform
         if ( params.platformHTTP != null ) {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 5_9 $params.platformHTTP"
-        afterScript "final_POST.sh $params.projectId $params.pipelineId 5_9 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 5_9 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId mlst_5_9 \"$params.platformSpecies\" true"
+        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 5_8 $params.platformHTTP"
+        afterScript "final_POST.sh $params.projectId $params.pipelineId 5_8 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 5_8 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId mlst_5_8 \"$params.platformSpecies\" true"
     } else {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
         }
@@ -893,16 +799,16 @@ process mlst_5_9 {
     set sample_id, file(assembly) from mlst_in_3_7
 
     output:
-    file '*.mlst.txt' into LOG_mlst_5_9
-    set sample_id, file(assembly), file(".status") into MAIN_mlst_out_5_9
-    set sample_id, val("5_9_mlst"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_mlst_5_9
-set sample_id, val("mlst_5_9"), val("5_9"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_mlst_5_9
+    file '*.mlst.txt' into LOG_mlst_5_8
+    set sample_id, file(assembly), file(".status") into MAIN_mlst_out_5_8
+    set sample_id, val("5_8_mlst"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_mlst_5_8
+set sample_id, val("mlst_5_8"), val("5_8"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_mlst_5_8
 file ".versions"
 
     script:
     """
     {
-        expectedSpecies=${params.mlstSpecies_5_9}
+        expectedSpecies=${params.mlstSpecies_5_8}
         mlst $assembly >> ${sample_id}.mlst.txt
         mlstSpecies=\$(cat *.mlst.txt | cut -f2)
         json_str="{'expectedSpecies':\'\$expectedSpecies\',\
@@ -926,12 +832,12 @@ file ".versions"
     """
 }
 
-process compile_mlst_5_9 {
+process compile_mlst_5_8 {
 
-    publishDir "results/annotation/mlst_5_9/"
+    publishDir "results/annotation/mlst_5_8/"
 
     input:
-    file res from LOG_mlst_5_9.collect()
+    file res from LOG_mlst_5_8.collect()
 
     output:
     file "mlst_report.tsv"
@@ -943,7 +849,7 @@ process compile_mlst_5_9 {
 }
 
 mlst_out_5_7 = Channel.create()
-MAIN_mlst_out_5_9
+MAIN_mlst_out_5_8
     .filter{ it[2].text != "fail" }
     .map{ [it[0], it[1]] }
     .set{ mlst_out_5_7 }
@@ -951,16 +857,16 @@ MAIN_mlst_out_5_9
 
 
 
-IN_kraken2_DB_6_10 = Channel.value(params.kraken2DB_6_10)
+IN_kraken2_DB_6_9 = Channel.value(params.kraken2DB_6_9)
 
 
 //Process to run Kraken2
-process kraken2_fasta_6_10 {
+process kraken2_fasta_6_9 {
 
     // Send POST request to platform
         if ( params.platformHTTP != null ) {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 6_10 $params.platformHTTP"
-        afterScript "final_POST.sh $params.projectId $params.pipelineId 6_10 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 6_10 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId kraken2_fasta_6_10 \"$params.platformSpecies\" true"
+        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 6_9 $params.platformHTTP"
+        afterScript "final_POST.sh $params.projectId $params.pipelineId 6_9 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 6_9 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId kraken2_fasta_6_9 \"$params.platformSpecies\" true"
     } else {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
         }
@@ -971,12 +877,12 @@ process kraken2_fasta_6_10 {
 
     input:
     set sample_id, file(assembly) from kraken2_fasta_in_3_8
-    val krakenDB from IN_kraken2_DB_6_10
+    val krakenDB from IN_kraken2_DB_6_9
 
     output:
     file("${sample_id}_kraken_report.txt")
-    set sample_id, val("6_10_kraken2_fasta"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_kraken2_fasta_6_10
-set sample_id, val("kraken2_fasta_6_10"), val("6_10"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_kraken2_fasta_6_10
+    set sample_id, val("6_9_kraken2_fasta"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_kraken2_fasta_6_9
+set sample_id, val("kraken2_fasta_6_9"), val("6_9"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_kraken2_fasta_6_9
 file ".versions"
 
     script:
@@ -986,47 +892,47 @@ file ".versions"
 }
 
 
-if ( params.abricateDataDir_7_11 ){
-    if ( !file(params.abricateDataDir_7_11).exists() ){
-        exit 1, "'abricateDataDir_7_11' data directory was not found: '${params.abricateDatabases_7_11}'"
+if ( params.abricateDataDir_7_10 ){
+    if ( !file(params.abricateDataDir_7_10).exists() ){
+        exit 1, "'abricateDataDir_7_10' data directory was not found: '${params.abricateDatabases_7_10}'"
     }
-    dataDirOpt = "--datadir ${params.abricateDataDir_7_11}"
+    dataDirOpt = "--datadir ${params.abricateDataDir_7_10}"
 } else {
     dataDirOpt = ""
 }
 
-if ( !params.abricateMinId_7_11.toString().isNumber() ){
-    exit 1, "'abricateMinId_7_11' parameter must be a number. Provide value: '${params.abricateMinId_7_11}'"
+if ( !params.abricateMinId_7_10.toString().isNumber() ){
+    exit 1, "'abricateMinId_7_10' parameter must be a number. Provide value: '${params.abricateMinId_7_10}'"
 }
 
-if ( !params.abricateMinCov_7_11.toString().isNumber() ){
-    exit 1, "'abricateMinCov_7_11' parameter must be a number. Provide value: '${params.abricateMinCov_7_11}'"
+if ( !params.abricateMinCov_7_10.toString().isNumber() ){
+    exit 1, "'abricateMinCov_7_10' parameter must be a number. Provide value: '${params.abricateMinCov_7_10}'"
 }
 
 
-process abricate_7_11 {
+process abricate_7_10 {
 
     // Send POST request to platform
         if ( params.platformHTTP != null ) {
-        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 7_11 $params.platformHTTP"
-        afterScript "final_POST.sh $params.projectId $params.pipelineId 7_11 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 7_11 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId abricate_7_11 \"$params.platformSpecies\" true"
+        beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh; startup_POST.sh $params.projectId $params.pipelineId 7_10 $params.platformHTTP"
+        afterScript "final_POST.sh $params.projectId $params.pipelineId 7_10 $params.platformHTTP; report_POST.sh $params.projectId $params.pipelineId 7_10 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId abricate_7_10 \"$params.platformSpecies\" true"
     } else {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; set_dotfiles.sh"
         }
 
     tag { "${sample_id} ${db}" }
-    publishDir "results/annotation/abricate_7_11/${sample_id}"
+    publishDir "results/annotation/abricate_7_10/${sample_id}"
 
     input:
     set sample_id, file(assembly) from abricate_in_3_9
-    each db from params.abricateDatabases_7_11
-    val min_id from Channel.value(params.abricateMinId_7_11)
-    val min_cov from Channel.value(params.abricateMinCov_7_11)
+    each db from params.abricateDatabases_7_10
+    val min_id from Channel.value(params.abricateMinId_7_10)
+    val min_cov from Channel.value(params.abricateMinCov_7_10)
 
     output:
-    file '*.tsv' into abricate_out_7_11
-    set sample_id, val("7_11_abricate_$db"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_abricate_7_11
-set sample_id, val("abricate_7_11_$db"), val("7_11"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_abricate_7_11
+    file '*.tsv' into abricate_out_7_10
+    set sample_id, val("7_10_abricate_$db"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_abricate_7_10
+set sample_id, val("abricate_7_10_$db"), val("7_10"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_abricate_7_10
 file ".versions"
 
     script:
@@ -1043,26 +949,26 @@ file ".versions"
 }
 
 
-process process_abricate_7_11 {
+process process_abricate_7_10 {
 
-    tag "process_abricate_7_11"
+    tag "process_abricate_7_10"
 
     // Send POST request to platform
     
         if ( params.platformHTTP != null ) {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh"
-        afterScript "report_POST.sh $params.projectId $params.pipelineId 7_11 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId abricate_7_11 \"$params.platformSpecies\" false"
+        afterScript "report_POST.sh $params.projectId $params.pipelineId 7_10 $params.sampleName $params.reportHTTP $params.currentUserName $params.currentUserId abricate_7_10 \"$params.platformSpecies\" false"
     } else {
         beforeScript "PATH=${workflow.projectDir}/bin:\$PATH; export PATH; set_dotfiles.sh"
         }
     
 
     input:
-    file abricate_file from abricate_out_7_11.collect()
+    file abricate_file from abricate_out_7_10.collect()
 
     output:
-    set val('process_abricate'), val("7_11_process_abricate"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_process_abricate_7_11
-set val('process_abricate'), val("process_abricate_7_11"), val("7_11"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_process_abricate_7_11
+    set val('process_abricate'), val("7_10_process_abricate"), file(".status"), file(".warning"), file(".fail"), file(".command.log") into STATUS_process_abricate_7_10
+set val('process_abricate'), val("process_abricate_7_10"), val("7_10"), file(".report.json"), file(".versions"), file(".command.trace") into REPORT_process_abricate_7_10
 file ".versions"
 
     script:
@@ -1083,7 +989,7 @@ process status {
     publishDir "pipeline_status/$task_name"
 
     input:
-    set sample_id, task_name, status, warning, fail, file(log) from STATUS_integrity_coverage_1_1.mix(STATUS_remove_host_1_2,STATUS_report_remove_host_1_2,STATUS_fastqc_1_3,STATUS_fastqc_report_1_3,STATUS_trimmomatic_1_3,STATUS_mashScreen_2_4,STATUS_mashOutputJson_2_4,STATUS_megahit_3_5,STATUS_megahit_fastg_3_5,STATUS_assembly_mapping_3_6,STATUS_process_am_3_6,STATUS_pilon_3_7,STATUS_pilon_report_3_7,STATUS_runMashDist_4_8,STATUS_mashDistOutputJson_4_8,STATUS_mlst_5_9,STATUS_kraken2_fasta_6_10,STATUS_abricate_7_11,STATUS_process_abricate_7_11)
+    set sample_id, task_name, status, warning, fail, file(log) from STATUS_integrity_coverage_1_1.mix(STATUS_remove_host_1_2,STATUS_report_remove_host_1_2,STATUS_fastqc_1_3,STATUS_fastqc_report_1_3,STATUS_trimmomatic_1_3,STATUS_mashScreen_2_4,STATUS_mashOutputJson_2_4,STATUS_megahit_3_5,STATUS_megahit_fastg_3_5,STATUS_maxbin2_3_6,STATUS_report_maxbin2_3_6,STATUS_runMashDist_4_7,STATUS_mashDistOutputJson_4_7,STATUS_mlst_5_8,STATUS_kraken2_fasta_6_9,STATUS_abricate_7_10,STATUS_process_abricate_7_10)
 
     output:
     file '*.status' into master_status
@@ -1152,7 +1058,7 @@ process report {
             pid,
             report_json,
             version_json,
-            trace from REPORT_integrity_coverage_1_1.mix(REPORT_remove_host_1_2,REPORT_report_remove_host_1_2,REPORT_fastqc_1_3,REPORT_fastqc_report_1_3,REPORT_trimmomatic_1_3,REPORT_mashScreen_2_4,REPORT_mashOutputJson_2_4,REPORT_megahit_3_5,REPORT_megahit_fastg_3_5,REPORT_assembly_mapping_3_6,REPORT_process_am_3_6,REPORT_pilon_3_7,REPORT_pilon_report_3_7,REPORT_runMashDist_4_8,REPORT_mashDistOutputJson_4_8,REPORT_mlst_5_9,REPORT_kraken2_fasta_6_10,REPORT_abricate_7_11,REPORT_process_abricate_7_11)
+            trace from REPORT_integrity_coverage_1_1.mix(REPORT_remove_host_1_2,REPORT_report_remove_host_1_2,REPORT_fastqc_1_3,REPORT_fastqc_report_1_3,REPORT_trimmomatic_1_3,REPORT_mashScreen_2_4,REPORT_mashOutputJson_2_4,REPORT_megahit_3_5,REPORT_megahit_fastg_3_5,REPORT_maxbin2_3_6,REPORT_report_maxbin2_3_6,REPORT_runMashDist_4_7,REPORT_mashDistOutputJson_4_7,REPORT_mlst_5_8,REPORT_kraken2_fasta_6_9,REPORT_abricate_7_10,REPORT_process_abricate_7_10)
 
     output:
     file "*" optional true into master_report

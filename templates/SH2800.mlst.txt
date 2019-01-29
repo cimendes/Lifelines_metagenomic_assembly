@@ -1,0 +1,1 @@
+/home/ines/test_prokka/fasta/SH2800.contigs.length_GCcontent_kmerCov.mappingCov.polished.fasta	sagalactiae	23	adhP(5)	pheS(4)	atr(6)	glnA(3)	sdhA(2)	glcK(1)	tkt(3)
